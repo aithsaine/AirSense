@@ -1,60 +1,91 @@
+import os
 import json
 import requests
+import logging
 import time
-import logging  # <-- Import de la bibliothèque
-from dotenv import get_key
-from quixstreams import Application
 
-# --- Configuration du logger ---
-logging.basicConfig(
-    level=logging.INFO, # Niveau minimum à afficher (INFO, WARNING, ERROR)
-    format='%(asctime)s - %(levelname)s - %(message)s', # Format : Date - Niveau - Message
-    datefmt='%Y-%m-%d %H:%M:%S'
+from dotenv import load_dotenv
+from kafka import KafkaProducer
+
+
+load_dotenv()  # Charge les variables d'environnement depuis le fichier .env
+API_KEY = os.getenv("OPENAQ_API_KEY", "VOTRE_CLE_API_ICI")
+LOCATION_ID = 2178
+BASE_URL = "https://api.openaq.org/v3"
+HEADERS = {"X-API-Key": API_KEY}
+
+# --- CONFIGURATION kafka ---
+KAFKA_TOPIC = "air_data"
+KAFKA_BROKER = "localhost:9092"
+POLL_INTERVAL = 300  # 5 minutes
+
+logging.basicConfig(level=logging.INFO)
+
+
+producer = KafkaProducer(
+    bootstrap_servers=[KAFKA_BROKER],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
-logger = logging.getLogger(__name__) # Crée un logger spécifique à ce fichier
 
-key = get_key('/home/ismail/Documents/S3/DataOps & MlOps/projects/AirSense/.env', "API_OPENAQ_KEY")
-print(key)
 
-def get_air_data():
-    try:
-        logger.info("Appel de l'API OpenAQ...")
-        response = requests.get(
-            "https://api.openaq.org/v3/locations/27/sensors",
-            headers={"X-API-Key": key},
-            timeout=10
-        )
-        response.raise_for_status() # Déclenche une erreur si le statut HTTP est 4xx ou 5xx
-        logger.info("Données récupérées avec succès.")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erreur lors de l'appel API : {e}")
-        return None
+def get_location_details(location_id):
+    """Récupère les métadonnées complètes de la station."""
+    url = f"{BASE_URL}/locations/{location_id}"
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    results = r.json().get("results", [])
+    return results[0] if results else None
+
+
+def get_location_sensors(location_id):
+    """Récupère la liste des capteurs avec leurs paramètres (nom, unité, couverture)."""
+    url = f"{BASE_URL}/locations/{location_id}/sensors"
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+
+def get_location_latest(location_id):
+    """Récupère les dernières mesures de tous les capteurs."""
+    url = f"{BASE_URL}/locations/{location_id}/latest"
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
 
 def main():
-    app = Application(broker_address="localhost:9092", loglevel="ERROR")
-    logger.info("Producteur démarré. Envoi des données vers Kafka...")
-    
-    with app.get_producer() as producer:
-        while True:
-            air_data = get_air_data()
-            
-            if air_data:
-                try:
-                    producer.produce(
-                        topic="air_data",
-                        key="Morocco".encode('utf-8'),
-                        value=json.dumps(air_data).encode('utf-8'),
-                    )
-                    producer.flush()
-                    logger.info("Données envoyées à Kafka avec succès.")
-                except Exception as e:
-                    logger.error(f"Erreur lors de l'envoi à Kafka : {e}")
-            else:
-                logger.warning("Aucune donnée reçue de l'API, on passe au cycle suivant.")
-            
-            # Attendre 5 secondes
-            time.sleep(60)
+    while True:
+        # 1. Métadonnées de la station
+        loc = get_location_details(LOCATION_ID)
+        if not loc:
+            logging.error("Station introuvable.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        # 2. Capteurs et paramètres
+        sensors = get_location_sensors(LOCATION_ID)
+
+        # 3. Dernières mesures
+        latest = get_location_latest(LOCATION_ID)
+
+        # 4. Sortie JSON complète (pour usage programmatique)
+        full_data = {
+            "location": loc,
+            "sensors": sensors,
+            "latest": latest,
+        }
+
+        if producer and full_data:
+            producer.send(KAFKA_TOPIC, full_data)
+            producer.flush()
+            logging.info(f"Message envoyé au topic Kafka '{KAFKA_TOPIC}'.")
+        else:
+            logging.warning("Le producteur Kafka n'est pas initialisé ou les données sont vides.")
+
+        # Attendre avant la prochaine itération
+        logging.info(f"Attente de {POLL_INTERVAL} secondes avant la prochaine collecte.")
+        time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
