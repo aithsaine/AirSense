@@ -1,9 +1,3 @@
-CREATE DATABASE airsense_db;
-
-\connect airsense_db
-
-
-
 -- ============================================================
 -- Table 1 : Mesures nettoyées et validées (Consumer 2)
 -- ============================================================
@@ -22,10 +16,6 @@ CREATE INDEX IF NOT EXISTS idx_clean_timestamp
     ON airsense_processed_data (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_clean_sensor
     ON airsense_processed_data (sensor_id);
-CREATE INDEX IF NOT EXISTS idx_clean_parameter
-    ON airsense_processed_data (parameter_name);
-CREATE INDEX IF NOT EXISTS idx_clean_status
-    ON airsense_processed_data (status);
 
 -- ============================================================
 -- Table 2 : Anomalies détectées (Consumer 3)
@@ -42,17 +32,11 @@ CREATE TABLE IF NOT EXISTS airsense_anomalies (
 );
 
 CREATE INDEX IF NOT EXISTS idx_anomalies_timestamp
-    ON air_quality_anomalies (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_anomalies_parameter
-    ON air_quality_anomalies (parameter_name);
+    ON airsense_anomalies (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_anomalies_status
-    ON air_quality_anomalies (status);
+    ON airsense_anomalies (status);
 
 
-CREATE INDEX IF NOT EXISTS idx_metrics_window
-    ON air_quality_metrics (window_start DESC);
-CREATE INDEX IF NOT EXISTS idx_metrics_sensor
-    ON air_quality_metrics (sensor_id);
 
 
 CREATE TABLE IF NOT EXISTS sensors_reference (

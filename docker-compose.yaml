@@ -15,17 +15,17 @@ services:
     environment:
       POSTGRES_USER: dataops
       POSTGRES_PASSWORD: dataops_password
-      POSTGRES_DB: airflow
+      POSTGRES_DB: airsense_db
     ports:
-      - "5430:5430"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dataops -d airflow"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U dataops -d airsense_db"]
+      interval: 5s
       timeout: 5s
-      retries: 10
-    restart: unless-stopped
+      retries: 5
 
   kafka:
     image: apache/kafka:3.9.1
@@ -64,7 +64,7 @@ services:
         condition: service_healthy
     environment: &airflow-common-env
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://dataops:dataops_password@postgres:5432/airflow
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://dataops:dataops_password@postgres:5430/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
