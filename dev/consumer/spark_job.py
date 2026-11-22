@@ -1,29 +1,11 @@
-# from kafka import KafkaConsumer
-# import json
-
-# consumer = KafkaConsumer(
-#     'air_data',
-#     bootstrap_servers=['localhost:9092'],
-#     auto_offset_reset='earliest',
-#     enable_auto_commit=True,
-#     auto_commit_interval_ms=5000,
-#     value_deserializer=lambda v: json.loads(v.decode('utf-8'))  # ← AJOUT
-# )
-
-# for message in consumer:
-#     print(json.dumps(message.value, indent=4))  # ← AJOUT
-    
-import os
 import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, to_timestamp, when, lit, to_json, struct, get_json_object
+    from_json, col, to_timestamp, when, lit, to_json, struct,
+    explode, udf
 )
 from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType, LongType
-)
-from pyspark.sql.functions import (
-    from_json, col, to_timestamp, when, lit, to_json, struct, get_json_object, explode
+    StructType, StructField, StringType, DoubleType, LongType, ArrayType
 )
 
 # --- LOGGING ---
@@ -36,25 +18,31 @@ TOPIC_PROCESSED = "processed_data"
 TOPIC_ANOMALIES = "anomalies"
 CHECKPOINT_BASE = "/tmp/spark-checkpoints/consumer1"
 
-# --- SCHÉMA VOLONTAIREMENT SIMPLE ---
-# On ne déclare que ce dont on a besoin. Les champs manquants seront null.
+# --- SCHÉMA ENRICHI : on inclut 'sensors' avec summary.min / summary.max ---
 schema = StructType([
     StructField("location", StructType([
         StructField("id", LongType(), True),
         StructField("name", StringType(), True),
     ]), True),
-    StructField("latest", StringType(), True),  # on garde le JSON brut de la liste
+    StructField("sensors", ArrayType(StructType([
+        StructField("id", LongType(), True),
+        StructField("name", StringType(), True),
+        StructField("parameter", StructType([
+            StructField("name", StringType(), True),
+            StructField("displayName", StringType(), True),
+            StructField("units", StringType(), True),
+        ]), True),
+        StructField("summary", StructType([
+            StructField("min", DoubleType(), True),
+            StructField("max", DoubleType(), True),
+            StructField("avg", DoubleType(), True),
+        ]), True),
+    ])), True),
+    StructField("latest", StringType(), True),
 ])
 
 
 def process_batch(batch_df, batch_id, spark):
-    """
-    Traite un micro-batch :
-    1. Parse le JSON de 'latest' (qui est une liste de mesures)
-    2. Explose la liste
-    3. Nettoie, valide, détecte les anomalies
-    4. Écrit dans les topics processed_data et anomalies
-    """
     if batch_df.rdd.isEmpty():
         logging.info(f"Batch {batch_id} vide, ignoré.")
         return
@@ -63,16 +51,23 @@ def process_batch(batch_df, batch_id, spark):
     df_base = batch_df.select(
         col("location.id").alias("location_id"),
         col("location.name").alias("location_name"),
+        col("sensors").alias("sensors_list"),
         col("latest").alias("latest_json"),
     )
 
-    # 2. On utilise get_json_object pour extraire chaque mesure de la liste
-    #    (approche alternative à explode + from_json)
-    #    On suppose que 'latest' est une liste JSON : [{"sensorsId":..., "value":...}, ...]
-    #    On va utiliser une UDF Python pour parser la liste, plus simple à déboguer.
-    from pyspark.sql.functions import udf
-    from pyspark.sql.types import ArrayType
+    # 2. Construction du mapping sensor_id -> (parameter, units, min, max)
+    df_sensor_map = df_base.select(
+        explode(col("sensors_list")).alias("s")
+    ).select(
+        col("s.id").alias("sensor_id"),
+        col("s.parameter.name").alias("parameter_name"),
+        col("s.parameter.displayName").alias("parameter_display"),
+        col("s.parameter.units").alias("units"),
+        col("s.summary.min").alias("valid_min"),
+        col("s.summary.max").alias("valid_max"),
+    ).dropDuplicates(["sensor_id"])
 
+    # 3. Parsing de 'latest' via UDF
     def parse_latest(json_str):
         import json
         if not json_str:
@@ -99,7 +94,6 @@ def process_batch(batch_df, batch_id, spark):
         StructField("value", DoubleType(), True),
         StructField("datetime_utc", StringType(), True),
     ]))
-
     parse_udf = udf(parse_latest, latest_schema)
 
     df_exploded = df_base.select(
@@ -114,26 +108,45 @@ def process_batch(batch_df, batch_id, spark):
         col("m.datetime_utc").alias("datetime_utc"),
     )
 
-    # 3. Nettoyage + validation
-    df_clean = df_exploded \
+    # 4. Jointure avec le mapping (inclut valid_min / valid_max)
+    df_enriched = df_exploded.join(df_sensor_map, on="sensor_id", how="left")
+
+    # 5. VALIDATION selon min/max du summary
+    #    - value hors [valid_min, valid_max] => INVALID_RANGE
+    #    - value dans la plage => NORMAL / WARNING / ANOMALY_HIGH
+    df_validated = df_enriched \
         .withColumn("timestamp", to_timestamp(col("datetime_utc"))) \
         .filter(
             col("value").isNotNull() &
-            (col("value") >= 0) &
-            col("timestamp").isNotNull()
+            col("timestamp").isNotNull() &
+            (col("value") >= 0)   # on garde >= 0, le reste est filtré plus bas
+        ) \
+        .withColumn(
+            "validation_status",
+            when(
+                col("valid_min").isNull() | col("valid_max").isNull(),
+                lit("NO_BOUNDS")          # pas de bornes disponibles
+            ).when(
+                (col("value") < col("valid_min")) | (col("value") > col("valid_max")),
+                lit("INVALID_RANGE")      # hors des bornes historiques
+            ).otherwise(lit("VALID"))
         ) \
         .withColumn(
             "status",
-            when(col("value") > 50, lit("ANOMALY_HIGH"))
+            when(col("validation_status") == "INVALID_RANGE", lit("INVALID_RANGE"))
+            .when(col("value") > 50, lit("ANOMALY_HIGH"))
             .when(col("value") > 35, lit("WARNING"))
             .otherwise(lit("NORMAL"))
         )
 
-    # 4. Écriture dans processed_data (toutes les mesures valides)
-    df_processed = df_clean.select(
+    # 6. Écriture dans processed_data (toutes les mesures, avec bornes et validation)
+    df_processed = df_validated.select(
         to_json(struct(
             "location_id", "location_name", "sensor_id",
-            "value", "datetime_utc", "timestamp", "status"
+            "parameter_name", "parameter_display", "units",
+            "value", "valid_min", "valid_max",
+            "validation_status",
+            "datetime_utc", "timestamp", "status"
         )).alias("value")
     )
 
@@ -143,15 +156,17 @@ def process_batch(batch_df, batch_id, spark):
         .option("topic", TOPIC_PROCESSED) \
         .save()
 
-    logging.info(f"Batch {batch_id} : {df_clean.count()} mesures écrites dans {TOPIC_PROCESSED}")
+    logging.info(f"Batch {batch_id} : {df_validated.count()} mesures écrites dans {TOPIC_PROCESSED}")
 
-    # 5. Écriture dans anomalies (uniquement ANOMALY_HIGH)
-    df_anomalies = df_clean \
+    # 7. Écriture dans anomalies (uniquement ANOMALY_HIGH, hors INVALID_RANGE)
+    df_anomalies = df_validated \
         .filter(col("status") == "ANOMALY_HIGH") \
         .select(
             to_json(struct(
                 "location_id", "location_name", "sensor_id",
-                "value", "datetime_utc", "timestamp", "status"
+                "parameter_name", "parameter_display", "units",
+                "value", "valid_min", "valid_max",
+                "datetime_utc", "timestamp", "status"
             )).alias("value")
         )
 
@@ -166,7 +181,7 @@ def process_batch(batch_df, batch_id, spark):
 
 def main():
     spark = SparkSession.builder \
-        .appName("AirSense-SparkJob-Alt") \
+        .appName("AirSense-SparkJob-MinMax") \
         .config("spark.jars.packages",
                 "org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0") \
         .config("spark.sql.adaptive.enabled", "false") \
@@ -174,7 +189,6 @@ def main():
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # Lecture du flux
     df_raw = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BROKER) \
@@ -183,18 +197,16 @@ def main():
         .option("failOnDataLoss", "false") \
         .load()
 
-    # Parsing initial
     df_parsed = df_raw.selectExpr("CAST(value AS STRING) as json_str") \
         .select(from_json(col("json_str"), schema).alias("d")) \
         .select("d.*")
 
-    # Traitement par batch
     query = df_parsed.writeStream \
         .foreachBatch(lambda df, bid: process_batch(df, bid, spark)) \
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/main") \
         .start()
 
-    logging.info("Spark job démarré. En attente de messages sur 'air_data'...")
+    logging.info("Spark job démarré (validation min/max activée).")
     query.awaitTermination()
 
 

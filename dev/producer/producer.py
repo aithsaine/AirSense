@@ -64,7 +64,10 @@ def main():
 
         # 2. Capteurs et paramètres
         sensors = get_location_sensors(LOCATION_ID)
-
+        print("************************** le sensors sont : ************************")
+        print (json.dumps(sensors, indent=4))  # Affiche les capteurs pour vérification
+        
+        print("************************** ************************")
         # 3. Dernières mesures
         latest = get_location_latest(LOCATION_ID)
 
@@ -79,6 +82,7 @@ def main():
             producer.send(KAFKA_TOPIC, full_data)
             producer.flush()
             logging.info(f"Message envoyé au topic Kafka '{KAFKA_TOPIC}'.")
+            logging.info(json.dumps(full_data, indent=4))  # Affiche le JSON complet pour vérification
         else:
             logging.warning("Le producteur Kafka n'est pas initialisé ou les données sont vides.")
 
